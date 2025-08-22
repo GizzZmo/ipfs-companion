@@ -13,214 +13,449 @@ import { safeURL } from './options.js'
 import { addRuleToDynamicRuleSetGenerator, isLocalHost, supportsDeclarativeNetRequest } from './redirect-handler/blockOrObserve.js'
 import { RequestTracker } from './trackers/requestTracker.js'
 
+/**
+ * IPFS Companion Request Modifier
+ *
+ * This module provides sophisticated HTTP request interception and modification capabilities
+ * for IPFS Companion. It acts as a middleware layer that intercepts web requests to:
+ *
+ * 1. Detect IPFS/IPNS content and redirect to appropriate gateways
+ * 2. Handle DNSLink resolution for decentralized websites
+ * 3. Implement request recovery mechanisms for failed IPFS requests
+ * 4. Manage cross-origin request security and CORS handling
+ * 5. Support protocol handlers for ipfs:// and ipns:// schemes
+ *
+ * Architecture Overview:
+ * - Uses webRequest API for request interception across multiple stages
+ * - Implements caching for performance optimization
+ * - Provides fallback mechanisms for request recovery
+ * - Handles browser-specific quirks and compatibility issues
+ *
+ * Request Processing Pipeline:
+ * 1. onBeforeRequest: Initial request analysis and potential redirects
+ * 2. onBeforeSendHeaders: Header modification for API compatibility
+ * 3. onHeadersReceived: Late-stage redirects based on response headers
+ * 4. onErrorOccurred: Network error recovery mechanisms
+ * 5. onCompleted: HTTP error code recovery mechanisms
+ *
+ * @author IPFS Companion Team
+ * @license CC0-1.0
+ */
+
 const log = debug('ipfs-companion:request')
 log.error = debug('ipfs-companion:request:error')
 
+// Configuration Constants
 export const redirectOptOutHint = 'x-ipfs-companion-no-redirect'
+
+/**
+ * Network errors that can potentially be recovered by redirecting to IPFS gateways
+ * Includes both Firefox-specific and Chromium-specific error codes
+ */
 const recoverableNetworkErrors = new Set([
-  // Firefox
-  'NS_ERROR_UNKNOWN_HOST', // dns failure
-  'NS_ERROR_NET_TIMEOUT', // eg. httpd is offline
-  'NS_ERROR_NET_RESET', // failed to load because the server kept reseting the connection
-  'NS_ERROR_NET_ON_RESOLVED', // no network
-  // Chrome
-  'net::ERR_NAME_NOT_RESOLVED', // dns failure
-  'net::ERR_CONNECTION_TIMED_OUT', // eg. httpd is offline
-  'net::ERR_INTERNET_DISCONNECTED' // no network
+  // Firefox error codes
+  'NS_ERROR_UNKNOWN_HOST', // DNS resolution failure
+  'NS_ERROR_NET_TIMEOUT', // Connection timeout (e.g., server offline)
+  'NS_ERROR_NET_RESET', // Connection reset by server
+  'NS_ERROR_NET_ON_RESOLVED', // Network connectivity issues
+
+  // Chromium error codes
+  'net::ERR_NAME_NOT_RESOLVED', // DNS resolution failure
+  'net::ERR_CONNECTION_TIMED_OUT', // Connection timeout
+  'net::ERR_INTERNET_DISCONNECTED' // Network connectivity issues
 ])
+
+/**
+ * Determines if an HTTP status code indicates a recoverable error
+ * @param {number} code - HTTP status code
+ * @returns {boolean} True if the error is recoverable via IPFS gateway redirect
+ */
 const recoverableHttpError = (code) => code && code >= 400
 
+// Global State Management
 // Tracking late redirects for edge cases such as https://github.com/ipfs-shipyard/ipfs-companion/issues/436
 const onHeadersReceivedRedirect = new Set()
 let addRuleToDynamicRuleSet = null
+
+// Request tracking for analytics and debugging
 const observedRequestTracker = new RequestTracker('url-observed')
 const resolvedRequestTracker = new RequestTracker('url-resolved')
 
-// Request modifier provides event listeners for the various stages of making an HTTP request
-// API Details: https://developer.mozilla.org/en-US/Add-ons/WebExtensions/API/webRequest
+/**
+ * Creates the main request modifier that provides event listeners for HTTP request lifecycle
+ *
+ * This factory function creates a comprehensive request interception system that handles:
+ * - IPFS/IPNS content detection and gateway redirection
+ * - DNSLink resolution for decentralized websites
+ * - API request header modification for CORS compatibility
+ * - Error recovery mechanisms for failed requests
+ * - Protocol handler support for ipfs:// and ipns:// schemes
+ *
+ * Architecture Pattern: Factory Function
+ * - Returns an object with webRequest API event handlers
+ * - Maintains closures over provided dependencies
+ * - Enables dependency injection for testability
+ *
+ * @param {Function} getState - Function that returns current companion state
+ * @param {Object} dnslinkResolver - DNSLink resolution service
+ * @param {Object} ipfsPathValidator - IPFS path validation service
+ * @param {Object} runtime - Browser runtime information and APIs
+ * @returns {Object} Request modifier with webRequest event handlers
+ */
 export function createRequestModifier (getState, dnslinkResolver, ipfsPathValidator, runtime) {
   const browser = runtime.browser
   const runtimeRoot = browser.runtime.getURL('/')
-  const webExtensionOrigin = runtimeRoot ? new URL(runtimeRoot).origin : 'http://companion-origin' // avoid 'null' because it has special meaning
+
+  // Determine web extension origin for request filtering
+  // Fallback to placeholder to avoid 'null' which has special meaning in security contexts
+  const webExtensionOrigin = runtimeRoot ? new URL(runtimeRoot).origin : 'http://companion-origin'
+
+  // Initialize dynamic rule set generator for Manifest V3 compatibility
   addRuleToDynamicRuleSet = addRuleToDynamicRuleSetGenerator(getState)
+  /**
+   * Detects if a request originated from the companion extension itself
+   *
+   * This function handles browser-specific inconsistencies in Origin header handling:
+   * - Firefox uses originUrl (includes path, Referer-like)
+   * - Chromium uses initiator (origin only, no path)
+   * - Different browsers have different behaviors across versions
+   *
+   * Algorithm:
+   * 1. Extract Origin from request metadata (originUrl or initiator)
+   * 2. Normalize to origin-only format using URL constructor
+   * 3. Compare with known extension origin
+   *
+   * Browser Compatibility Notes:
+   * - Firefox Nightly 65: moz-extension://{extension-installation-id}
+   * - Chromium <72: null
+   * - Chromium Beta 72: chrome-extension://{uid}
+   * - Firefox Nightly 85: null
+   *
+   * @param {Object} request - webRequest request object
+   * @returns {boolean} True if request originated from companion extension
+   */
   const isCompanionRequest = (request) => {
-    // We inspect webRequest object (WebExtension API) instead of Origin HTTP
-    // header because the value of the latter changed over the years ad
-    // absurdum. It leaks the unique extension ID and no vendor seem to have
-    // coherent  policy around it, Firefox and Chromium flip back and forth:
-    // Firefox  Nightly 65 sets moz-extension://{extension-installation-id}
-    // Chromium        <72 sets null
-    // Chromium Beta    72 sets chrome-extension://{uid}
-    // Firefox  Nightly 85 sets null
     const { originUrl, initiator } = request
-    // Of course, getting "Origin" is vendor-specific:
-    // FF: originUrl (Referer-like Origin URL with path)
-    // Chromium: initiator (just Origin, no path)
-    // Because of this mess, we normalize Origin by reading it from URL.origin
-    const { origin } = new URL(originUrl || initiator || 'http://missing-origin')
-    return origin === webExtensionOrigin
+
+    // Normalize origin extraction across browsers
+    // Use fallback to prevent null origin which has special security meaning
+    const requestOrigin = new URL(originUrl || initiator || 'http://missing-origin').origin
+
+    return requestOrigin === webExtensionOrigin
   }
 
-  // Various types of requests are identified once and cached across all browser.webRequest hooks
-  const requestCacheCfg = { max: 128, ttl: 1000 * 30 }
-  const ignoredRequests = new LRU(requestCacheCfg)
-  const ignore = (id) => ignoredRequests.set(id, true)
-  const isIgnored = (id) => ignoredRequests.get(id) !== undefined
+  // Request Classification and Caching System
+  // High-performance caching to avoid redundant processing of requests
+  const requestCacheConfig = { max: 128, ttl: 1000 * 30 } // 30-second TTL
+  const ignoredRequests = new LRU(requestCacheConfig)
+  const ignore = (requestId) => ignoredRequests.set(requestId, true)
+  const isIgnored = (requestId) => ignoredRequests.get(requestId) !== undefined
+
+  // Error tracking to prevent duplicate processing in Chromium
+  // Chromium sometimes fires duplicate error events
   const errorInFlight = new LRU({ max: 3, ttl: 1000 })
 
-  // Returns a canonical hostname representing the site from url
-  // Main reason for this is unwrapping DNSLink from local subdomain
-  // <fqdn>.ipns.localhost → <fqdn>
+  /**
+   * Extracts canonical FQDN from URL, handling special IPFS subdomain cases
+   *
+   * Primary use case: Converting DNSLink subdomains back to their canonical form
+   * Example: <fqdn>.ipns.localhost → <fqdn>
+   *
+   * Algorithm:
+   * 1. Check if URL uses IPNS subdomain format
+   * 2. If so, extract original FQDN using DNSLink resolver
+   * 3. Otherwise, return hostname directly
+   *
+   * @param {string} url - URL to analyze
+   * @returns {Promise<string>} Canonical hostname for the site
+   */
   const findSiteFqdn = async (url) => {
     if (isIPFS.ipnsSubdomain(url)) {
-      // convert subdomain's <fqdn>.ipns.gateway.tld to <fqdn>
-      const fqdn = await dnslinkResolver.findDNSLinkHostname(url)
-      if (fqdn) return fqdn
+      // Extract original FQDN from subdomain format
+      // Convert: <fqdn>.ipns.gateway.tld → <fqdn>
+      const originalFqdn = await dnslinkResolver.findDNSLinkHostname(url)
+      if (originalFqdn) return originalFqdn
     }
     return new URL(url).hostname
   }
 
-  // Finds canonical hostname of request.url and its parent page (if present)
+  /**
+   * Determines canonical hostnames for both request URL and its parent page
+   *
+   * This is essential for:
+   * - Per-site settings and opt-out detection
+   * - DNSLink resolution context
+   * - Security policy enforcement
+   *
+   * Algorithm:
+   * 1. Extract FQDN from request URL
+   * 2. Determine parent page URL (Firefox: originUrl, Chrome: initiator)
+   * 3. Extract parent FQDN if different from request URL
+   * 4. Handle special case where Chromium sets initiator to 'null'
+   *
+   * @param {Object} request - webRequest request object
+   * @returns {Promise<Object>} Object with fqdn and parentFqdn properties
+   */
   const findSiteHostnames = async (request) => {
     const { url, originUrl, initiator } = request
     const fqdn = await findSiteFqdn(url)
-    // FF: originUrl (Referer-like Origin URL), Chrome: initiator (just Origin)
+
+    // Handle browser differences in parent URL reporting
     const parentUrl = originUrl || initiator
-    // String value 'null' is explicitly set by Chromium in some contexts
+
+    // Chromium explicitly sets initiator to 'null' string in some contexts
     const parentFqdn = parentUrl && parentUrl !== 'null' && url !== parentUrl
       ? await findSiteFqdn(parentUrl)
       : null
+
     return { fqdn, parentFqdn }
   }
 
+  /**
+   * Pre-processing filter to skip requests that shouldn't be handled
+   *
+   * This function implements early filtering to avoid processing requests that would:
+   * - Create infinite recursion (gateway/API requests)
+   * - Be incompatible with IPFS gateways (WebSocket connections)
+   * - Be blocked by user preferences (opt-out settings)
+   * - Be unnecessary to process (localhost requests)
+   *
+   * Algorithm:
+   * 1. Check for recursion-prone requests (gateway/API URLs)
+   * 2. Filter out incompatible request types (WebSockets)
+   * 3. Skip localhost requests (not suitable for IPFS redirection)
+   * 4. Apply per-site opt-out settings
+   * 5. Trigger DNSLink preloading for main frame requests
+   *
+   * Performance Optimization:
+   * - Early return prevents expensive processing
+   * - Caching system avoids duplicate checks
+   * - DNSLink preloading runs asynchronously
+   *
+   * @param {Object} state - Current companion state
+   * @param {Object} request - webRequest request object
+   * @returns {Promise<boolean>} True if request should be ignored
+   */
   const preNormalizationSkip = async (state, request) => {
-    // skip requests to the custom gateway or API (otherwise we have too much recursion)
+    // Prevent infinite recursion: skip requests to configured gateway or API
     if (sameGateway(request.url, state.gwURL) || sameGateway(request.url, state.apiURL)) {
       ignore(request.requestId)
     }
-    // skip websocket handshake (not supported by HTTP2IPFS gateways)
+
+    // Skip WebSocket handshakes - not supported by HTTP-to-IPFS gateways
     if (request.type === 'websocket') {
       ignore(request.requestId)
     }
-    // skip all local requests
+
+    // Skip localhost requests - not suitable for IPFS gateway redirection
     if (isLocalHost(request.url)) {
       ignore(request.requestId)
     }
 
-    // skip if a per-site opt-out exists
+    // Per-site opt-out handling
     const { fqdn, parentFqdn } = await findSiteHostnames(request)
-    const triggerOptOut = (optout) => {
-      // Disable optout on canonical public gateway
+
+    /**
+     * Checks if a site matches any opt-out pattern
+     * Special case: Never opt-out the canonical public gateway
+     */
+    const triggerOptOut = (optoutPattern) => {
+      // Preserve functionality on canonical public gateway
       if (fqdn === 'gateway.ipfs.io') return false
-      if (fqdn.endsWith(optout) || (parentFqdn && parentFqdn.endsWith(optout))) return true
-      return false
+
+      // Check if current or parent site matches opt-out pattern
+      return fqdn.endsWith(optoutPattern) ||
+             (parentFqdn && parentFqdn.endsWith(optoutPattern))
     }
+
     if (state.disabledOn.some(triggerOptOut)) {
       ignore(request.requestId)
     }
 
-    // additional checks limited to requests for root documents
+    // Background DNSLink preloading for main frame requests
     if (request.type === 'main_frame') {
-      // lazily trigger DNSLink lookup (will do anything only if status for root domain is not in cache)
+      // Trigger asynchronous DNSLink lookup if policy allows
+      // This populates the cache for potential future redirects
       if (state.dnslinkPolicy && dnslinkResolver.canLookupURL(request.url)) {
-        dnslinkResolver.resolve(request.url) // no await: preload record in background
+        dnslinkResolver.resolve(request.url) // Async, no await - background preload
       }
     }
+
     return isIgnored(request.requestId)
   }
 
+  /**
+   * Post-processing filter for additional request filtering
+   *
+   * Applied after initial URL normalization to catch edge cases where
+   * redirection would create problematic loops or conflicts.
+   *
+   * Algorithm:
+   * 1. Check if local gateway is available
+   * 2. Prevent redirects to public gateway when no local node
+   * 3. Mark request as ignored to prevent further processing
+   *
+   * Future Enhancement:
+   * Could redirect to native ipfs:// and ipns:// protocols when
+   * hasNativeProtocolHandler === true
+   *
+   * @param {Object} state - Current companion state
+   * @param {Object} request - webRequest request object
+   * @returns {boolean} True if request should be ignored
+   */
   const postNormalizationSkip = (state, request) => {
-    // skip requests to the public gateway if we can't reedirect them to local
-    // node is running (otherwise we have too much recursion)
+    // Prevent redirect loops when local gateway is unavailable
+    // If we can't redirect to local gateway, don't redirect public gateway requests
     if (!state.localGwAvailable && sameGateway(request.url, state.pubGwURL)) {
       ignore(request.requestId)
-      // TODO: do not skip and redirect to `ipfs://` and `ipns://` if hasNativeProtocolHandler === true
+      // TODO: Implement native protocol redirect when supported
+      // if (hasNativeProtocolHandler) redirect to ipfs:// or ipns://
     }
+
     return isIgnored(request.requestId)
   }
 
-  // Build RequestModifier
+  // Request Handler Factory - Returns the main request modifier object
   return {
-    // browser.webRequest.onBeforeRequest
-    // This event is triggered when a request is about to be made, and before headers are available.
-    // This is a good place to listen if you want to cancel or redirect the request.
+    /**
+     * onBeforeRequest: Primary request interception and redirection handler
+     *
+     * This is the main entry point for request processing, triggered before
+     * any HTTP headers are available. It handles:
+     *
+     * 1. Node recovery scenarios (offline local node)
+     * 2. Gateway normalization for subdomain support
+     * 3. API request normalization
+     * 4. Protocol handler support (ipfs://, ipns://)
+     * 5. IPFS content detection and redirection
+     * 6. DNSLink resolution and redirection
+     *
+     * Processing Pipeline:
+     * 1. Early state checks and request tracking
+     * 2. Node recovery handling for offline scenarios
+     * 3. Gateway URL normalization for optimal routing
+     * 4. Pre-processing filters for request classification
+     * 5. Protocol handler support for ipfs:// and ipns:// schemes
+     * 6. IPFS content detection and gateway redirection
+     * 7. DNSLink resolution and IPNS redirection
+     *
+     * @param {Object} request - webRequest request object
+     * @returns {Promise<Object|undefined>} Redirect object or undefined
+     */
     async onBeforeRequest (request) {
       const state = getState()
+
+      // Early exit if companion is disabled
       if (!state.active) return
+
+      // Track request for analytics and debugging
       observedRequestTracker.track(request)
 
-      // When local IPFS node is unreachable , show recovery page where user can redirect
-      // to public gateway.
-      if (!state.nodeActive && request.type === 'main_frame' && sameGateway(request.url, state.gwURL)) {
-        const publicUri = await ipfsPathValidator.resolveToPublicUrl(request.url, state.pubGwURLString)
+      // Node Recovery Scenario: Offline Local Gateway
+      // When local IPFS node is unreachable, show recovery page
+      // allowing user to redirect to public gateway
+      if (!state.nodeActive &&
+          request.type === 'main_frame' &&
+          sameGateway(request.url, state.gwURL)) {
+        const publicGatewayUrl = await ipfsPathValidator.resolveToPublicUrl(
+          request.url,
+          state.pubGwURLString
+        )
+
+        // Redirect to recovery page with public gateway URL as parameter
         return handleRedirection({
           originUrl: request.url,
-          redirectUrl: `${dropSlash(runtimeRoot)}${recoveryPagePath}#${encodeURIComponent(publicUri)}`,
+          redirectUrl: `${dropSlash(runtimeRoot)}${recoveryPagePath}#${encodeURIComponent(publicGatewayUrl)}`,
           request
         })
       }
 
-      // When Subdomain Proxy is enabled we normalize address bar requests made
-      // to the local gateway and replace raw IP with 'localhost' hostname to
-      // take advantage of subdomain redirect provided by go-ipfs >= 0.5
-      if (state.redirect && request.type === 'main_frame' && sameGateway(request.url, state.gwURL)) {
-        const redirectUrl = safeURL(request.url, { useLocalhostName: state.useSubdomains }).toString()
+      // Gateway Normalization: Subdomain Support Optimization
+      // When subdomain proxy is enabled, normalize address bar requests to local gateway
+      // Replace raw IP with 'localhost' hostname for go-ipfs >= 0.5 subdomain support
+      if (state.redirect &&
+          request.type === 'main_frame' &&
+          sameGateway(request.url, state.gwURL)) {
+        const normalizedUrl = safeURL(request.url, {
+          useLocalhostName: state.useSubdomains
+        }).toString()
+
         return handleRedirection({
           originUrl: request.url,
-          redirectUrl,
+          redirectUrl: normalizedUrl,
           request
         })
       }
 
-      // For now normalize API to the IP to comply with go-ipfs checks
-      if (state.redirect && request.type === 'main_frame' && sameGateway(request.url, state.apiURL)) {
-        const redirectUrl = safeURL(request.url, { useLocalhostName: false }).toString()
+      // API Request Normalization: IP Address Compliance
+      // Normalize API requests to use IP address for go-ipfs compatibility checks
+      if (state.redirect &&
+          request.type === 'main_frame' &&
+          sameGateway(request.url, state.apiURL)) {
+        const normalizedApiUrl = safeURL(request.url, {
+          useLocalhostName: false
+        }).toString()
+
         return handleRedirection({
           originUrl: request.url,
-          redirectUrl,
+          redirectUrl: normalizedApiUrl,
           request
         })
       }
 
-      // early sanity checks
+      // Pre-processing Filters: Early Request Classification
       if (await preNormalizationSkip(state, request)) {
-        return
+        return // Request marked for skipping
       }
-      // poor-mans protocol handlers - https://github.com/ipfs/ipfs-companion/issues/164#issuecomment-328374052
+
+      // Protocol Handler Support: Unhandled IPFS Protocols
+      // Fallback mechanism for browsers without native protocol handler support
+      // Handles search hijacking scenarios where ipfs:// URLs become search queries
       if (state.catchUnhandledProtocols && mayContainUnhandledIpfsProtocol(request)) {
-        const fix = await normalizedUnhandledIpfsProtocol(request, state.pubGwURLString)
-        if (fix) {
-          return fix
+        const protocolFix = await normalizedUnhandledIpfsProtocol(request, state.pubGwURLString)
+        if (protocolFix) {
+          return protocolFix
         }
       }
-      // handler for protocol_handlers from manifest.json
+
+      // Protocol Handler Support: Manifest-declared Handlers
+      // Handle protocol_handlers from manifest.json (Firefox-specific)
       if (redirectingProtocolRequest(request)) {
-        // fix path passed via custom protocol
-        const fix = normalizedRedirectingProtocolRequest(request, state.pubGwURLString)
-        if (fix) {
-          return fix
+        const manifestFix = normalizedRedirectingProtocolRequest(request, state.pubGwURLString)
+        if (manifestFix) {
+          return manifestFix
         }
       }
-      // handle redirects to custom gateway
+
+      // Main Redirection Logic: IPFS Content Detection and Gateway Routing
       if (state.redirect) {
-        // late sanity checks
+        // Post-processing filters for edge cases
         if (postNormalizationSkip(state, request)) {
           return
         }
-        // Detect valid /ipfs/ and /ipns/ on any site
-        if (await ipfsPathValidator.publicIpfsOrIpnsResource(request.url) && isSafeToRedirect(request, runtime)) {
+
+        // Direct IPFS/IPNS Path Detection
+        // Detect valid /ipfs/ and /ipns/ paths on any website
+        if (await ipfsPathValidator.publicIpfsOrIpnsResource(request.url) &&
+            isSafeToRedirect(request, runtime)) {
           return redirectToGateway(request, request.url, state, ipfsPathValidator, runtime)
         }
-        // Detect dnslink using heuristics enabled in Preferences
+
+        // DNSLink Resolution and Redirection
+        // Handle decentralized websites using DNS TXT records
         if (state.dnslinkPolicy && dnslinkResolver.canLookupURL(request.url)) {
+          // Active DNSLink redirection (when enabled)
           if (state.dnslinkRedirect) {
-            const dnslinkAtGw = await dnslinkResolver.dnslinkAtGateway(request.url)
-            if (dnslinkAtGw && isSafeToRedirect(request, runtime)) {
-              return redirectToGateway(request, dnslinkAtGw, state, ipfsPathValidator, runtime)
+            const dnslinkGatewayUrl = await dnslinkResolver.dnslinkAtGateway(request.url)
+            if (dnslinkGatewayUrl && isSafeToRedirect(request, runtime)) {
+              return redirectToGateway(request, dnslinkGatewayUrl, state, ipfsPathValidator, runtime)
             }
           } else if (state.dnslinkDataPreload) {
+            // Background data preloading (when redirection disabled but preloading enabled)
             dnslinkResolver.preloadData(request.url)
           }
+
+          // Best-effort DNSLink resolution for cache population
           if (state.dnslinkPolicy === 'best-effort') {
             dnslinkResolver.resolve(request.url)
           }
